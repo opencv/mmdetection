@@ -1,6 +1,11 @@
 import ast
 from mmcv import DictAction
 
+import torch
+from mmcv.parallel import MMDataParallel
+from mmcv.parallel import MMDistributedDataParallel
+from mmdet.parallel import MMDataCPU
+
 
 class ExtendedDictAction(DictAction):
     """
@@ -21,3 +26,23 @@ class ExtendedDictAction(DictAction):
                     val = val[0]
             options[key] = val
         setattr(namespace, self.dest, options)
+
+
+def prepare_mmdet_model_for_execution(model, cfg, distributed=False):
+    if torch.cuda.is_available():
+        if distributed:
+            # put model on gpus
+            find_unused_parameters = cfg.get('find_unused_parameters', False)
+            # Sets the `find_unused_parameters` parameter in
+            # torch.nn.parallel.DistributedDataParallel
+            model = MMDistributedDataParallel(
+                model,
+                device_ids=[torch.cuda.current_device()],
+                broadcast_buffers=False,
+                find_unused_parameters=find_unused_parameters)
+        else:
+            model = MMDataParallel(
+                model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+    else:
+        model = MMDataCPU(model)
+    return model

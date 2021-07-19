@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 import torch
 
+from mmdet.utils import get_root_logger
+
 
 _is_nncf_enabled = importlib.util.find_spec('nncf') is not None
 
@@ -66,7 +68,7 @@ def no_nncf_trace():
     """
 
     if is_nncf_enabled():
-        from nncf.dynamic_graph.context import no_nncf_trace as original_no_nncf_trace
+        from nncf.torch.dynamic_graph.context import no_nncf_trace as original_no_nncf_trace
         return original_no_nncf_trace()
     return nullcontext()
 
@@ -75,10 +77,24 @@ def is_in_nncf_tracing():
     if not is_nncf_enabled():
         return False
 
-    from nncf.dynamic_graph.context import get_current_context
+    from nncf.torch.dynamic_graph.context import get_current_context
 
     ctx = get_current_context()
 
     if ctx is None:
         return False
     return ctx.is_tracing
+
+
+def is_accuracy_aware_training_set(nncf_config):
+    if not is_nncf_enabled():
+        return False
+    from nncf.config.utils import is_accuracy_aware_training
+    is_acc_aware_training_set = is_accuracy_aware_training(nncf_config)
+    if is_acc_aware_training_set:
+        logger = get_root_logger()
+        if 'target_metric_name' not in nncf_config:
+            logger.warning('The "target_metric_name" parameter not '
+                           'found in the NNCF config - proceeding with the default "bbox_mAP"')
+            nncf_config.target_metric_name = 'bbox_mAP'
+    return is_acc_aware_training_set

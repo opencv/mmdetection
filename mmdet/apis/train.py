@@ -3,20 +3,24 @@ import numpy as np
 import random
 import torch
 from copy import copy
-from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner, LoggerHook,
                          Fp16OptimizerHook, OptimizerHook, build_optimizer, load_checkpoint,
                          build_runner)
 
 from mmdet.core import (DistEvalHook, DistEvalPlusBeforeRunHook, EvalHook,
                         EvalPlusBeforeRunHook)
-from mmdet.integration.nncf import CompressionHook, CheckpointHookBeforeTraining, wrap_nncf_model
-from mmdet.parallel import MMDataCPU
+from mmdet.integration.nncf import CompressionHook
+from mmdet.integration.nncf import CheckpointHookBeforeTraining
+from mmdet.integration.nncf import wrap_nncf_model
+from mmdet.integration.nncf import AccuracyAwareRunner
+from mmdet.integration.nncf import is_accuracy_aware_training_set
 from mmcv.utils import build_from_cfg
 
 from mmdet.datasets import (build_dataloader, build_dataset,
                             replace_ImageToTensor)
 from mmdet.utils import get_root_logger
+from mmdet.utils import prepare_mmdet_model_for_execution
+
 from .fake_input import get_fake_input
 
 
@@ -97,10 +101,29 @@ def train_detector(model,
     if torch.cuda.is_available():
         model = model.cuda()
 
+    val_dataloader = None
+    if validate:
+        # Support batch_size > 1 in validation
+        val_samples_per_gpu = cfg.data.val.pop('samples_per_gpu', 1)
+        if val_samples_per_gpu > 1:
+            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
+            cfg.data.val.pipeline = replace_ImageToTensor(
+                cfg.data.val.pipeline)
+        val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
+        val_dataloader = build_dataloader(
+            val_dataset,
+            samples_per_gpu=val_samples_per_gpu,
+            workers_per_gpu=cfg.data.workers_per_gpu,
+            dist=distributed,
+            shuffle=False)
+
     # nncf model wrapper
+    compression_ctrl = None
+    nncf_config = cfg.get('nncf_config')
+    is_acc_aware_training_set = is_accuracy_aware_training_set(nncf_config)
     nncf_enable_compression = bool(cfg.get('nncf_config'))
     if nncf_enable_compression:
-        data_loader_for_init = build_dataloader(
+        dataloader_for_init = build_dataloader(
             dataset[0],
             1,
             cfg.data.workers_per_gpu,
@@ -110,37 +133,30 @@ def train_detector(model,
             seed=cfg.seed
         )
 
-        compression_ctrl, model = wrap_nncf_model(model, cfg, data_loader_for_init, get_fake_input)
-    else:
-        compression_ctrl = None
+        compression_ctrl, model = wrap_nncf_model(model, cfg,
+                                                  val_dataloader=val_dataloader,
+                                                  dataloader_for_init=dataloader_for_init,
+                                                  get_fake_input_func=get_fake_input)
 
-    if torch.cuda.is_available():
-        if distributed:
-            # put model on gpus
-            find_unused_parameters = cfg.get('find_unused_parameters', False)
-            # Sets the `find_unused_parameters` parameter in
-            # torch.nn.parallel.DistributedDataParallel
-            model = MMDistributedDataParallel(
-                model,
-                device_ids=[torch.cuda.current_device()],
-                broadcast_buffers=False,
-                find_unused_parameters=find_unused_parameters)
-        else:
-            model = MMDataParallel(
-                model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
-    else:
-        model = MMDataCPU(model)
-
+    model = prepare_mmdet_model_for_execution(model, cfg, distributed)
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)
-
     if 'runner' not in cfg:
+        runner_cls = EpochBasedRunner
+        if nncf_enable_compression and is_acc_aware_training_set:
+            runner_cls = AccuracyAwareRunner
         cfg.runner = {
-            'type': 'EpochBasedRunner',
+            'type': runner_cls,
             'max_epochs': cfg.total_epochs
         }
     else:
+        if is_acc_aware_training_set and cfg.runner.type != 'AccuracyAwareRunner':
+            raise RuntimeError('Accuracy-aware training parameters were specified '
+                               'in the compression config, but the runner type '
+                               'specified in the config differs from "AccuracyAwareRunner". '
+                               'Please specify runner.type="AccuracyAwareRunner" in the config'
+                               'to run the accuracy-aware training loop')
         if 'total_epochs' in cfg:
             assert cfg.total_epochs == cfg.runner.max_epochs
 
@@ -177,19 +193,6 @@ def train_detector(model,
 
     # register eval hooks
     if validate:
-        # Support batch_size > 1 in validation
-        val_samples_per_gpu = cfg.data.val.pop('samples_per_gpu', 1)
-        if val_samples_per_gpu > 1:
-            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
-            cfg.data.val.pipeline = replace_ImageToTensor(
-                cfg.data.val.pipeline)
-        val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
-        val_dataloader = build_dataloader(
-            val_dataset,
-            samples_per_gpu=val_samples_per_gpu,
-            workers_per_gpu=cfg.data.workers_per_gpu,
-            dist=distributed,
-            shuffle=False)
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
         eval_hook = DistEvalHook if distributed else EvalHook
@@ -217,4 +220,11 @@ def train_detector(model,
     if cfg.resume_from:
         runner.resume(cfg.resume_from, map_location=map_location)
 
-    runner.run(data_loaders, cfg.workflow, compression_ctrl=compression_ctrl)
+    def configure_optimizers_fn():
+        optimizer = build_optimizer(runner.model, cfg.optimizer)
+        return optimizer, None
+
+    runner.run(data_loaders, cfg.workflow,
+               compression_ctrl=compression_ctrl,
+               configure_optimizers_fn=configure_optimizers_fn,
+               nncf_config=nncf_config)

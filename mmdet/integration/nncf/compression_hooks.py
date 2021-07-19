@@ -15,7 +15,8 @@ class CompressionHook(Hook):
 
     def before_run(self, runner):
         if runner.rank == 0:
-            print_statistics(self.compression_ctrl.statistics(), runner.logger)
+            statistics = self.compression_ctrl.statistics()
+            runner.logger.info(statistics.to_str())
 
 
 @HOOKS.register_module()
@@ -45,18 +46,3 @@ class CheckpointHookBeforeTraining(Hook):
             self.out_dir = runner.work_dir
         runner.save_checkpoint(
             self.out_dir, filename_tmpl='before_training.pth', save_optimizer=self.save_optimizer, **self.args)
-
-
-def print_statistics(stats, logger):
-    try:
-        from texttable import Texttable
-        texttable_imported = True
-    except ImportError:
-        texttable_imported = False
-
-    for key, val in stats.items():
-        if texttable_imported and isinstance(val, Texttable):
-            logger.info(key)
-            logger.info(val.draw())
-        else:
-            logger.info('{}: {}'.format(key, val))
